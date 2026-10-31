@@ -42,6 +42,15 @@ class Permission implements Authorizator, Voter
 	private ?string $queriedRole = null;
 	private ?string $queriedResource = null;
 
+	/**
+	 * Memo of decide() results: "role\0resource\0privilege" (null All encoded as '') => result, see decide().
+	 * Cleared on every change of roles, resources or rules; switched off for good once an assertion is added.
+	 * @var array<string, int>
+	 */
+	private array $memo = [];
+	private int $memoSize = 0;
+	private bool $memoEnabled = true;
+
 
 	/********************* roles ****************d*g**/
 
@@ -58,6 +67,12 @@ class Permission implements Authorizator, Voter
 		$this->checkRole($role, exists: false);
 		if (isset($this->roles[$role])) {
 			throw new Nette\InvalidStateException("Role '$role' already exists in the list.");
+		}
+
+		$this->memo = [];
+		$this->memoSize = 0;
+		if (str_contains($role, "\0")) {
+			$this->memoEnabled = false;
 		}
 
 		$roleParents = [];
@@ -164,6 +179,8 @@ class Permission implements Authorizator, Voter
 	{
 		$this->checkRole($role);
 
+		$this->memo = [];
+		$this->memoSize = 0;
 		foreach ($this->roles[$role]['children'] as $child => $foo) {
 			unset($this->roles[$child]['parents'][$role]);
 		}
@@ -187,6 +204,8 @@ class Permission implements Authorizator, Voter
 	 */
 	public function removeAllRoles(): static
 	{
+		$this->memo = [];
+		$this->memoSize = 0;
 		$this->roles = [];
 		$this->rules['allResources']['byRole'] = [];
 
@@ -213,6 +232,12 @@ class Permission implements Authorizator, Voter
 
 		if (isset($this->resources[$resource])) {
 			throw new Nette\InvalidStateException("Resource '$resource' already exists in the list.");
+		}
+
+		$this->memo = [];
+		$this->memoSize = 0;
+		if (str_contains($resource, "\0")) {
+			$this->memoEnabled = false;
 		}
 
 		if ($parent !== null) {
@@ -307,6 +332,8 @@ class Permission implements Authorizator, Voter
 	{
 		$this->checkResource($resource);
 
+		$this->memo = [];
+		$this->memoSize = 0;
 		$parent = $this->resources[$resource]['parent'];
 		if ($parent !== null) {
 			unset($this->resources[$parent]['children'][$resource]);
@@ -326,6 +353,8 @@ class Permission implements Authorizator, Voter
 	 */
 	public function removeAllResources(): static
 	{
+		$this->memo = [];
+		$this->memoSize = 0;
 		$this->resources = [];
 		$this->rules['byResource'] = [];
 		return $this;
@@ -426,6 +455,12 @@ class Permission implements Authorizator, Voter
 		?callable $assertion = null,
 	): void
 	{
+		$this->memo = [];
+		$this->memoSize = 0;
+		if ($assertion !== null) {
+			$this->memoEnabled = false; // assertions may depend on anything, results must not be reused
+		}
+
 		// ensure that all specified Roles exist; normalize input to array of Roles or null
 		if ($roles === self::All) {
 			$roles = [self::All];
@@ -568,6 +603,16 @@ class Permission implements Authorizator, Voter
 				$this->checkResource($resource);
 			}
 
+			$memoize = $this->memoEnabled && $privilege !== ''; // role and resource are non-empty here
+			if ($memoize) {
+				// unambiguous: roles and resources (the first two parts) never contain "\0", see addRole() and addResource()
+				$key = $role . "\0" . $resource . "\0" . $privilege; // $resource is replaced by its ancestors below
+				$hit = $this->memo[$key] ?? null;
+				if ($hit !== null) {
+					return $hit === 2 ? null : (bool) $hit;
+				}
+			}
+
 			$byDefault = false;
 			do {
 				// depth-first search on $role if it is not 'allRoles' pseudo-parent
@@ -602,7 +647,18 @@ class Permission implements Authorizator, Voter
 				$resource = $this->resources[$resource]['parent']; // try next Resource
 			} while (true);
 
-			return $byDefault && $result === self::Deny ? null : $result;
+			$result = $byDefault && $result === self::Deny ? null : $result;
+			if ($memoize) {
+				if ($this->memoSize >= 4096) {
+					$this->memo = [];
+					$this->memoSize = 0;
+				}
+
+				$this->memo[$key] = $result === null ? 2 : (int) $result;
+				$this->memoSize++;
+			}
+
+			return $result;
 
 		} finally {
 			// restores previous values to keep the method re-entrant (assertions may call isAllowed() again)
